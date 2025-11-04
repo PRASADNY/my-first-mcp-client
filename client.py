@@ -1,23 +1,24 @@
 import asyncio
+import sys
+import json
 from typing import Optional
 from contextlib import AsyncExitStack
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from anthropic import AsyncAnthropic
-from anthropic.types import ToolParam, Message
+import ollama
 
 from dotenv import load_dotenv
 
 load_dotenv()  # load environment variables from .env
 
 class MCPClient:
-    def __init__(self):
+    def __init__(self, model: str = "llama3.2"):
         # Initialize session and client objects
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
-        self.anthropic = AsyncAnthropic()
+        self.model = model
     # methods will go here
 
     async def connect_to_server(self, server_script_path: str):
@@ -26,66 +27,123 @@ class MCPClient:
         Args:
             server_script_path: Path to the server script (.py or .js)
         """
+        import os
+        
+        # Resolve the absolute path
+        if not os.path.isabs(server_script_path):
+            server_script_path = os.path.abspath(server_script_path)
+        
+        if not os.path.exists(server_script_path):
+            raise FileNotFoundError(f"Server script not found: {server_script_path}")
+        
         is_python = server_script_path.endswith('.py')
         is_js = server_script_path.endswith('.js')
         if not (is_python or is_js):
             raise ValueError("Server script must be a .py or .js file")
 
-        command = "python" if is_python else "node"
+        # Use sys.executable to ensure we use the same Python interpreter
+        command = sys.executable if is_python else "node"
         server_params = StdioServerParameters(
             command=command,
             args=[server_script_path],
             env=None
         )
+        
+        print(f"Connecting to MCP server: {server_script_path}")
 
-        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-        self.stdio, self.write = stdio_transport
-        self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
+        try:
+            stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
+            self.stdio, self.write = stdio_transport
+            self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
 
-        await self.session.initialize()
+            print("Initializing session...")
+            await self.session.initialize()
+            print("Session initialized successfully")
 
-        # List available tools
-        response = await self.session.list_tools()
-        tools = response.tools
-        print("\nConnected to server with tools:", [tool.name for tool in tools])
+            # List available tools
+            print("Fetching available tools...")
+            response = await self.session.list_tools()
+            tools = response.tools
+            print("\nConnected to server with tools:", [tool.name for tool in tools])
+        except Exception as e:
+            print(f"Error connecting to server: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
     async def process_query(self, query: str) -> str:
-        """Process a query using Claude and available tools"""
+        """Process a query using Ollama and available tools"""
         if self.session is None:
             raise RuntimeError("Session is not initialized. Call connect_to_server() first.")
 
-        # Convert the human message to the SDK MessageParam object
-        messages = [{"role": "user", "content": query}]
-
-        # Get available tools from the server and convert to ToolParam for the Anthropic SDK
+        # Get available tools from the server and convert to Ollama format
         response = await self.session.list_tools()
         available_tools = response.tools  # list of tool objects from the MCP server
-        tool_params = [ToolParam(**tool.model_dump()) for tool in available_tools]
+        
+        # Convert MCP tools to Ollama function calling format
+        tools = []
+        for tool in available_tools:
+            tool_dict = tool.model_dump()
+            # Convert to OpenAI-compatible format for Ollama
+            function_def = {
+                "type": "function",
+                "function": {
+                    "name": tool_dict.get("name", ""),
+                    "description": tool_dict.get("description", ""),
+                    "parameters": tool_dict.get("inputSchema", {})
+                }
+            }
+            tools.append(function_def)
 
-        # Call Claude (await the async call) using MessageParam objects
-        response = await self.anthropic.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=1000,
+        # Call Ollama with tool/function calling support
+        messages = [{"role": "user", "content": query}]
+        
+        # Use Ollama's chat API with tools
+        response = await asyncio.to_thread(
+            ollama.chat,
+            model=self.model,
             messages=messages,
-            tools=tool_params
+            tools=tools if tools else None
         )
 
-        # Collect text outputs; safely handle other content types (e.g., tool_use) without raising type errors
-        final_text = []
-        for content in getattr(response, "content", []):
-            text = getattr(content, "text", None)
-            if text:
-                final_text.append(text)
-            else:
-                ctype = getattr(content, "type", None)
-                if ctype == "tool_use":
-                    name = getattr(content, "name", "<tool>")
-                    final_text.append(f"[Tool call requested: {name}]")
+        # Handle response
+        message = response.get("message", {})
+        content = message.get("content", "")
+        
+        # Check if tool calls were made
+        tool_calls = message.get("tool_calls", [])
+        if tool_calls:
+            # Execute tool calls and get responses
+            tool_responses = []
+            for tool_call in tool_calls:
+                function = tool_call.get("function", {})
+                function_name = function.get("name", "")
+                function_args_raw = function.get("arguments", {})
+                
+                # Parse arguments if it's a string
+                if isinstance(function_args_raw, str):
+                    try:
+                        function_args = json.loads(function_args_raw)
+                    except json.JSONDecodeError:
+                        function_args = {}
                 else:
-                    # Generic fallback for unknown content shapes
-                    final_text.append(str(content))
-
-        return "\n".join(final_text) if final_text else ""
-        return ""
+                    function_args = function_args_raw if isinstance(function_args_raw, dict) else {}
+                
+                # Call the MCP tool
+                try:
+                    tool_result = await self.session.call_tool(function_name, arguments=function_args)
+                    # Extract text content from tool result
+                    if hasattr(tool_result, 'content'):
+                        result_text = tool_result.content[0].text if (hasattr(tool_result.content, '__iter__') and len(tool_result.content) > 0) else str(tool_result.content)
+                    else:
+                        result_text = str(tool_result)
+                    tool_responses.append(f"Tool '{function_name}' result: {result_text}")
+                except Exception as e:
+                    tool_responses.append(f"Error calling tool '{function_name}': {str(e)}")
+            
+            # Combine content and tool responses
+            return "\n".join([content] + tool_responses) if content else "\n".join(tool_responses)
+        
+        return content if content else ""
 
     async def chat_loop(self):
         """Run an interactive chat loop"""
@@ -111,19 +169,25 @@ class MCPClient:
 
 
 async def main():
-    #if len(sys.argv) < 2:
-     #   print("Usage: python client.py <path_to_server_script>")
-    #sys.exit(1)
-
-  #  print(sys.argv[1])
+    # Use the server path from command line if provided, otherwise use default
+    if len(sys.argv) >= 2:
+        server_path = sys.argv[1]
+    else:
+        # Default path relative to client directory
+        import os
+        server_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'my-first-mcp-server', 'main.py')
+        print(f"Using default server path: {server_path}")
 
     client = MCPClient()
     try:
-        await client.connect_to_server('..\\my-first-mcp-server\\main.py')
+        await client.connect_to_server(server_path)
         await client.chat_loop()
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
     finally:
         await client.cleanup()
 
 if __name__ == "__main__":
-    import sys
     asyncio.run(main())
