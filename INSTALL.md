@@ -73,3 +73,5 @@ python -c "import dotenv; print('python-dotenv installed')"
 - **Ollama**: Make sure Ollama is also installed on your system (separate from Python package)
 - **MCP**: The `[cli]` extra includes command-line tools for MCP
 
+
+
